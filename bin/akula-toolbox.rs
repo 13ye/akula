@@ -4,13 +4,13 @@ use akula::{
     consensus::{engine_factory, Consensus, ForkChoiceMode},
     hex_to_bytes,
     kv::{
-        tables::{self, BitmapKey, CHAINDATA_TABLES},
+        tables::{self, BitmapKey, CHAINDATA_TABLES, LOGDATA_TABLES},
         traits::*,
     },
     models::*,
     p2p::node::NodeBuilder,
     stagedsync,
-    stages::*,
+    stages::*, accessors::chain, Buffer, StageId, execution::{analysis_cache::AnalysisCache, tracer::NoopTracer, processor::ExecutionProcessor},
 };
 use anyhow::{ensure, format_err, Context};
 use bytes::Bytes;
@@ -82,6 +82,12 @@ pub enum OptCommand {
     DbDrop {
         #[clap(long)]
         table: String,
+    },
+
+    /// Save receipt
+    DbReceipt {
+        #[clap(long)]
+        max_height: Option<u64>,
     },
 
     /// Check table equality in two databases
@@ -266,6 +272,16 @@ fn open_db_rw(
     )
 }
 
+fn open_logs_rw(
+    data_dir: AkulaDataDir,
+) -> anyhow::Result<akula::kv::mdbx::MdbxEnvironment<mdbx::NoWriteMap>> {
+    akula::kv::mdbx::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
+        mdbx::Environment::new(),
+        &data_dir.log_data_dir(),
+        &LOGDATA_TABLES,
+    )
+}
+
 fn table_sizes(data_dir: AkulaDataDir, csv: bool) -> anyhow::Result<()> {
     let env = open_db(data_dir)?;
 
@@ -345,6 +361,7 @@ fn select_db_decode(table: &str, key: &[u8], value: &[u8]) -> anyhow::Result<(St
             HeadersTotalDifficulty,
             BlockBody,
             BlockTransaction,
+            BlockReceipt,
             TotalGas,
             TotalTx,
             LogAddressIndex,
@@ -397,7 +414,11 @@ fn db_walk(
     starting_key: Option<Bytes>,
     max_entries: Option<usize>,
 ) -> anyhow::Result<()> {
-    let env = open_db(data_dir)?;
+    let env = if table != "BlockReceipt" {
+        open_db(data_dir)?
+    } else {
+        open_logs_rw(data_dir)?
+    };
 
     let txn = env.begin_ro_txn()?;
     let db = txn
@@ -458,6 +479,71 @@ fn db_drop(data_dir: AkulaDataDir, table: String) -> anyhow::Result<()> {
         txn.drop_db(db)?;
     }
     txn.commit()?;
+
+    Ok(())
+}
+
+fn db_receipt(data_dir: AkulaDataDir, max_height: Option<u64>) -> anyhow::Result<()> {
+    let env = open_db(data_dir.clone())?;
+    let log_env = open_logs_rw(data_dir)?;
+
+    let txn = env.begin()?;
+    let log_txn = log_env.begin_mutable()?;
+
+    const STAGE_ID: StageId = StageId("Receipt");
+
+    let chain_spec = chain::chain_config::read(&txn)?
+        .ok_or_else(|| format_err!("chain specification not found"))?;
+    let mut block_number = STAGE_ID.get_progress(&log_txn)?.unwrap_or_default();
+    let tip = EXECUTION.get_progress(&txn)?.unwrap_or_default();
+
+    // Prepare the execution context.
+
+    let mut engine = engine_factory(None, chain_spec.clone(), None)?;
+    let mut analysis_cache = AnalysisCache::default();
+    let mut tracer = NoopTracer;
+
+    while block_number < tip {
+        if let Some(max_height) = max_height {
+            if max_height <= block_number.0 {
+                break;
+            }
+        }
+        let mut buffer = Buffer::new(&txn, Some(block_number));
+        block_number.0 += 1;
+        if block_number.0 % 100_000 == 0 {
+            println!("running block #{block_number}");
+        }
+        let start_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        let header = chain::header::read(&txn, block_number)?.ok_or_else(|| {
+                format_err!("header not found for block #{block_number}")
+            })?;
+        let block_body = chain::block_body::read_with_senders(&txn, block_number)?
+            .ok_or_else(|| {
+                format_err!("body not found for block #{block_number}")
+            })?;
+        let block_execution_spec = chain_spec.collect_block_spec(block_number);
+
+        let mut processor = ExecutionProcessor::new(
+            &mut buffer,
+            &mut tracer,
+            &mut analysis_cache,
+            &mut *engine,
+            &header,
+            &block_body,
+            &block_execution_spec,
+        );
+
+        let receipts = processor.execute_block_no_post_validation()?;
+        for (idx, receipt) in receipts.into_iter().enumerate() {
+            log_txn.set(tables::BlockReceipt, TxIndex(idx as u64 + start_idx), receipt)?;
+        }
+    }
+    STAGE_ID.save_progress(&log_txn, block_number)?;
+
+    log_txn.commit()?;
 
     Ok(())
 }
@@ -758,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
         OptCommand::DbSet { table, key, value } => db_set(opt.data_dir, table, key, Some(value))?,
         OptCommand::DbUnset { table, key } => db_set(opt.data_dir, table, key, None)?,
         OptCommand::DbDrop { table } => db_drop(opt.data_dir, table)?,
+        OptCommand::DbReceipt { max_height } => db_receipt(opt.data_dir, max_height)?,
         OptCommand::CheckEqual { db1, db2, table } => check_table_eq(db1, db2, table)?,
         OptCommand::ReadBlock { block_number } => read_block(opt.data_dir, block_number)?,
         OptCommand::ReadAccount {

@@ -726,6 +726,23 @@ impl TableDecode for crate::models::Account {
     }
 }
 
+impl TableEncode for crate::models::Receipt {
+    type Encoded = Vec<u8>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = Self::Encoded::default();
+        fastrlp::Encodable::encode(&self, &mut out);
+        out
+    }
+}
+
+impl TableDecode for crate::models::Receipt {
+    fn decode(mut b: &[u8]) -> anyhow::Result<Self> {
+        let result = fastrlp::Decodable::decode(&mut b)?;
+        Ok(result)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountChange {
     pub address: Address,
@@ -890,6 +907,7 @@ decl_table!(Header => BlockNumber => BlockHeader);
 decl_table!(HeadersTotalDifficulty => BlockNumber => U256);
 decl_table!(BlockBody => BlockNumber => BodyForStorage);
 decl_table!(BlockTransaction => TxIndex => MessageWithSignature);
+decl_table!(BlockReceipt => TxIndex => Receipt);
 decl_table!(TotalGas => BlockNumber => u64);
 decl_table!(TotalTx => BlockNumber => u64);
 decl_table!(LogAddressIndex => BitmapKey<Address> => RoaringTreemap);
@@ -962,6 +980,13 @@ pub static CHAINDATA_TABLES: Lazy<Arc<DatabaseChart>> = Lazy::new(|| {
 
 pub static SENTRY_TABLES: Lazy<Arc<DatabaseChart>> =
     Lazy::new(|| Arc::new([].into_iter().collect()));
+
+pub static LOGDATA_TABLES: Lazy<Arc<DatabaseChart>> =
+    Lazy::new(|| Arc::new([
+        table_entry!(SyncStage),
+        table_entry!(BlockReceipt),
+        table_entry!(Version),
+    ].into_iter().collect()));
 
 #[cfg(test)]
 mod tests {
