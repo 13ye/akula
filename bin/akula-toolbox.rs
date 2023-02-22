@@ -275,9 +275,13 @@ fn open_db_rw(
 fn open_logs_rw(
     data_dir: AkulaDataDir,
 ) -> anyhow::Result<akula::kv::mdbx::MdbxEnvironment<mdbx::NoWriteMap>> {
+    let log_data_dir = data_dir.log_data_dir();
+    if !log_data_dir.exists() {
+        akula::kv::new_database(&LOGDATA_TABLES, &log_data_dir)?;
+    }
     akula::kv::mdbx::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
-        &data_dir.log_data_dir(),
+        &log_data_dir,
         &LOGDATA_TABLES,
     )
 }
