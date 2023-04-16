@@ -848,7 +848,13 @@ async fn main() -> anyhow::Result<()> {
         OptCommand::DbSet { table, key, value } => db_set(opt.data_dir, table, key, Some(value))?,
         OptCommand::DbUnset { table, key } => db_set(opt.data_dir, table, key, None)?,
         OptCommand::DbDrop { table } => db_drop(opt.data_dir, table)?,
-        OptCommand::DbReceipt { max_height } => db_receipt(opt.data_dir, max_height)?,
+        OptCommand::DbReceipt { max_height } => {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024 * 1024)
+                .spawn(move || {
+                    db_receipt(opt.data_dir, max_height)
+                }).expect("spawn").join().expect("join")?;
+        }
         OptCommand::CheckEqual { db1, db2, table } => check_table_eq(db1, db2, table)?,
         OptCommand::ReadBlock { block_number } => read_block(opt.data_dir, block_number)?,
         OptCommand::ReadAccount {
