@@ -514,13 +514,14 @@ fn db_receipt(data_dir: AkulaDataDir, max_height: Option<u64>) -> anyhow::Result
             }
         }
         let mut buffer = Buffer::new(&txn, Some(block_number));
+
+        let start_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
         block_number.0 += 1;
         if block_number.0 % 100_000 == 0 {
             println!("running block #{block_number}");
         }
-        let start_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
-                format_err!("totaltx not calculated for block #{block_number}")
-            })?;
         let header = chain::header::read(&txn, block_number)?.ok_or_else(|| {
                 format_err!("header not found for block #{block_number}")
             })?;
@@ -542,6 +543,10 @@ fn db_receipt(data_dir: AkulaDataDir, max_height: Option<u64>) -> anyhow::Result
 
         let receipts = processor.execute_block_no_post_validation()?;
         for (idx, receipt) in receipts.into_iter().enumerate() {
+            // if !receipt.logs.is_empty() {
+            //     let tx = chain::tx::read(&txn, idx as u64 + start_idx, 1)?;
+            //     println!("{}:{}+{} {} => {:?} {:?}", block_number, start_idx, idx, receipt.logs.len(), tx[0].hash(), tx[0].message);
+            // }
             log_txn.set(tables::BlockReceipt, TxIndex(idx as u64 + start_idx), receipt)?;
         }
     }
