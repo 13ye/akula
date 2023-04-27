@@ -1,8 +1,23 @@
 #![feature(never_type)]
+#![feature(byte_slice_trim_ascii)]
+
+use min_max::{max, min};
 use akula::{
+    clkhs::{
+        model::{
+            TxMessage,
+            TxReceiptLog
+        },
+        execution::{
+            clkhs_select_id,
+            clkhs_insert_txmsgs,
+            clkhs_insert_receipts
+        }
+    },
     binutil::AkulaDataDir,
     consensus::{engine_factory, Consensus, ForkChoiceMode},
     hex_to_bytes,
+    execution,
     kv::{
         tables::{self, BitmapKey, CHAINDATA_TABLES, LOGDATA_TABLES},
         traits::*,
@@ -88,6 +103,14 @@ pub enum OptCommand {
     DbReceipt {
         #[clap(long)]
         max_height: Option<u64>,
+    },
+
+    /// Save txs message
+    DbTxslog {
+        #[clap(long)]
+        max_height: Option<u64>,
+        #[clap(long)]
+        start_height: Option<u64>,
     },
 
     /// Check table equality in two databases
@@ -557,6 +580,197 @@ fn db_receipt(data_dir: AkulaDataDir, max_height: Option<u64>) -> anyhow::Result
     Ok(())
 }
 
+fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Option<u64>, start_logs_id:u64) -> anyhow::Result<(Vec<TxReceiptLog>, Vec<TxMessage>)> {
+    let env = open_db(data_dir.clone())?;
+    let txn = env.begin()?;
+
+    let mut block_number = BlockNumber(0);
+    if let Some(start_height) = start_height {
+        block_number = BlockNumber(start_height);
+    }
+    let chaintip = EXECUTION.get_progress(&txn)?.unwrap_or_default();
+
+    // already query next logs_id
+    let mut logs_id:u64 =  start_logs_id;
+    let mut tx_idx = TxIndex(0);
+
+    // Prepare the execution context.
+    let chain_spec = chain::chain_config::read(&txn)?
+        .ok_or_else(|| format_err!("chain specification not found"))?;
+    let mut engine = engine_factory(None, chain_spec.clone(), None)?;
+    let mut analysis_cache = AnalysisCache::default();
+    let mut tracer = NoopTracer;
+
+    // Prepare MsgSignature DB
+    let table_msg = "BlockTransaction";
+    let txn_ro= env.begin_ro_txn()?;
+    let db_msg = txn_ro
+        .open_db(Some(&table_msg))
+        .with_context(|| format!("failed to open table: {}", table_msg))?;
+
+    // Prepare TxSender DB
+    let table_sender = "TxSender";
+    let db_sender = txn_ro
+        .open_db(Some(&table_sender))
+        .with_context(|| format!("failed to open table: {}", table_sender))?;
+
+    let mut vec_logs:Vec<TxReceiptLog> = Vec::new();
+    let mut vec_txmsg:Vec<TxMessage> = Vec::new();
+    println!("start_block:{block_number} block_sync:{chaintip} max_height:{:?}", max_height);
+    let block_stat_time = std::time::Instant::now();
+    let idx_stat_time = std::time::Instant::now();
+    while block_number < chaintip {
+        if let Some(max_height) = max_height {
+            if max_height <= block_number.0 {
+                break;
+            }
+        }
+        if block_number.0 % 10_000 == 0 {
+            println!("running block #{block_number} time_elapsed[{:?}]", block_stat_time.elapsed());
+        }
+        let mut buffer = Buffer::new(&txn, Some(block_number));
+        let start_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        block_number.0 += 1;
+        let end_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        let header = chain::header::read(&txn, block_number)?.ok_or_else(|| {
+                format_err!("header not found for block #{block_number}")
+            })?;
+        let block_body = chain::block_body::read_with_senders(&txn, block_number)?
+            .ok_or_else(|| {
+                format_err!("body not found for block #{block_number}")
+            })?;
+        let block_execution_spec = chain_spec.collect_block_spec(block_number);
+
+        //println!("blok_num[{block_number}] spec_{:#?}\n& header[{:#?}]\n&block_bod[{:#?}]", block_execution_spec, header, block_body);
+
+        let mut processor = ExecutionProcessor::new(
+            &mut buffer,
+            &mut tracer,
+            &mut analysis_cache,
+            &mut *engine,
+            &header,
+            &block_body,
+            &block_execution_spec,
+        );
+
+        // get Receipts in this block
+        let receipts = processor.execute_block_no_post_validation()?;
+
+        // get TxSenders in this block
+        let key_blk_number = u64::from(tx_idx).to_be_bytes();
+        let tx_senders_op = txn_ro.get::<Vec<u8>>(&db_sender, &key_blk_number)?;
+        let mut tx_senders:Vec<Address> = Vec::new();
+        if let Some(tx_senders_op) = tx_senders_op{
+            for i in 0..tx_senders_op.len()/20{
+                let mut addr_bytes = [0u8; 20];
+                addr_bytes.copy_from_slice(&tx_senders_op[i*20..(i+1)*20]);
+                tx_senders.push(Address::from(addr_bytes));
+            }
+        }
+
+        // start iterate TxMessage in this block, also Receipts, and push them into vecs
+        let mut cumulative_gas_used = 0;
+        for idx in start_idx..end_idx{
+            if idx % 1_000 == 0{
+                println!("block_num[{block_number}] txs_cnt[{idx}] logs_id[{logs_id}] tx_senders[{:?}] len_vec_logs[{:?}] len_vec_txmsg[{:?}] idx_time_elapsed[{:?}]", tx_senders.len(), vec_logs.len(), vec_txmsg.len(), idx_stat_time.elapsed());
+            }
+            tx_idx = TxIndex(idx as u64);
+            let key_idx = u64::from(tx_idx).to_be_bytes();
+            let msg_bytes = txn_ro.get::<Vec<u8>>(&db_msg, &key_idx)?;
+
+            if let Some(msg_bytes) = &msg_bytes{
+                match MessageWithSignature::compact_decode(msg_bytes){
+                    Err(e) => {
+                        println!("Err in decoding MessageWithSignature, {:?}",e);
+                        return Err(e);
+                    },
+                    Ok(message_with_signature) => {
+                        let receipt = receipts[(idx-start_idx) as usize].clone();
+                        let input_len = message_with_signature.message.input().len();
+
+                        let mut inputs_4bytes = [0u8; 4];
+                        if input_len > 0{
+                            inputs_4bytes[..min(4, input_len)].copy_from_slice(message_with_signature.message.input().slice(0..min(input_len, 4)).as_ref());
+                        }
+
+                        let mut row_txs : TxMessage = TxMessage {
+                            idx,
+                            idx_in_block: idx-start_idx,
+                            block_number: block_number.0,
+                            hash: primitive_types::U256::from_big_endian(message_with_signature.hash().as_bytes()),
+                            chain_id: None,
+                            nonce: message_with_signature.message.nonce(),
+                            gas_limit: message_with_signature.message.gas_limit(),
+                            gas_used: receipt.cumulative_gas_used - cumulative_gas_used, // receipt
+                            gas_priority_fee: primitive_types::U256::from_big_endian(message_with_signature.message.max_priority_fee_per_gas().to_be_bytes().as_slice()),
+                            gas_fee: primitive_types::U256::from_big_endian(message_with_signature.message.max_fee_per_gas2().to_be_bytes().as_slice()),
+                            transfer: primitive_types::U256::from_big_endian(message_with_signature.message.value().to_be_bytes().as_slice()),
+                            input_len: input_len as u64,
+                            input_first_4bytes: u32::from_be_bytes(inputs_4bytes),//if input_len==0 {0} else {u32::from_be_bytes(message_with_signature.message.input().slice(0..min(input_len, 4)).try_into().unwrap())},
+                            input_last_32bytes: if input_len==0 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(message_with_signature.message.input().slice(max(0, input_len as i64 - 32) as usize..).as_ref().try_into().unwrap())},
+                            from: if (tx_senders.len() <= (idx-start_idx) as usize) {primitive_types::U256::from(0x0)} else{primitive_types::U256::from_big_endian(tx_senders[(idx-start_idx) as usize].as_bytes())}, // txsender
+                            to: primitive_types::U256::from(0),
+                            success: receipt.success, // receipt
+                            is_create: false,
+                            logs_count: receipt.logs.len() as u64, // receipt
+                        };
+                        // chain_id may by None
+                        if let Some(chain_id) = message_with_signature.message.chain_id(){
+                            //row_txs.chain_id = chain_id.as_i256().0[0];
+                            row_txs.chain_id = Some(u64::from_be_bytes(chain_id.to_be_bytes()));
+                        }
+                        // Action call, recording address as 'to', else record as contract_address... both record into field 'to'
+                        if message_with_signature.message.action() == TransactionAction::Create{
+                            row_txs.is_create = true;
+                            if (tx_senders.len() > (idx-start_idx) as usize) {
+                               row_txs.to = primitive_types::U256::from_big_endian(execution::address::create_address(tx_senders[(idx-start_idx) as usize], message_with_signature.message.nonce()).as_bytes());
+                            }
+                        }
+                        else{
+                            let call_address = message_with_signature.message.action().into_address();
+                            if let Some(call_address) = call_address{
+                                row_txs.to = primitive_types::U256::from_big_endian(call_address.as_bytes());
+                            }
+                        }
+
+                        for (_id_log, log_obj) in receipt.logs.into_iter().enumerate(){
+                            logs_id += 1;
+                            let data_len = log_obj.data.len();
+                            let row_log : TxReceiptLog = TxReceiptLog {
+                                id: logs_id,
+                                tx_idx: u64::from(tx_idx),
+                                tx_message_hash: row_txs.hash,
+                                address: primitive_types::U256::from_big_endian(log_obj.address.as_bytes()),
+                                data_len: data_len as u64,
+                                data_prefix: if data_len==0 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.data.slice(0..min!(32, data_len)).as_ref().try_into().unwrap())},
+                                topic_num: log_obj.topics.len() as u8,
+                                topic0: if log_obj.topics.len()<1 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[0].as_bytes())},
+                                topic1: if log_obj.topics.len()<2 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[1].as_bytes())},
+                                topic2: if log_obj.topics.len()<3 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[2].as_bytes())},
+                                topic3: if log_obj.topics.len()<4 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[3].as_bytes())},
+                                topic4: if log_obj.topics.len()<5 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[4].as_bytes())}
+                            };
+                            vec_logs.push(row_log);
+                        } // end of for_logs
+
+                        // finish txmessage construct, push into vec
+                        vec_txmsg.push(row_txs);
+                        cumulative_gas_used = receipt.cumulative_gas_used;
+                    }
+                }
+            }
+        } // end of for_idx
+    } // end of while_block_number
+
+    println!("Finish processing data, ready to insert into database, blockNumber[{:?}] tx_idx[{:?}] logs_id[{logs_id}] len_log[{:?}] len_txmsg[{:?}]", block_number, tx_idx, vec_logs.len(), vec_txmsg.len());
+    Ok((vec_logs, vec_txmsg))
+}
+
+
 fn check_table_eq(
     db1_path: ExpandedPathBuf,
     db2_path: ExpandedPathBuf,
@@ -853,13 +1067,64 @@ async fn main() -> anyhow::Result<()> {
         OptCommand::DbSet { table, key, value } => db_set(opt.data_dir, table, key, Some(value))?,
         OptCommand::DbUnset { table, key } => db_set(opt.data_dir, table, key, None)?,
         OptCommand::DbDrop { table } => db_drop(opt.data_dir, table)?,
+
         OptCommand::DbReceipt { max_height } => {
             std::thread::Builder::new()
                 .stack_size(128 * 1024 * 1024)
                 .spawn(move || {
-                    db_receipt(opt.data_dir, max_height)
-                }).expect("spawn").join().expect("join")?;
+                    return db_receipt(opt.data_dir, max_height)
+            }).expect("spawn").join().expect("join").ok();
         }
+
+        OptCommand::DbTxslog { max_height, start_height } => {
+            let mut start_logs_id:u64 = 0;
+            futures::executor::block_on(async{
+                let id_rlt = clkhs_select_id().await;
+                match id_rlt {
+                    Ok(id_rlt)=> {
+                        start_logs_id = id_rlt;
+                    },
+                    Err(error) => {
+                        println!("clkhs_select_logs_id_error_occurs{:?}", error);
+                    } ,
+                };
+            });
+            println!("@@@ begin processing data, max_h[{:?}] start_h[{:?}] start_log_id[{start_logs_id}]", max_height, start_height);
+
+            let vec_rlts = std::thread::Builder::new()
+                .stack_size(128 * 1024 * 1024)
+                .spawn(move || {
+                    return db_txs_logs(opt.data_dir, max_height, start_height, start_logs_id);
+                }).expect("spawn").join().expect("join").ok();
+
+            if let Some(vec_rlts) = vec_rlts{
+                let vec_logs = vec_rlts.0;
+                let vec_txmsgs = vec_rlts.1;
+                println!("@@@ start insert into database! logs_len[{:?}], txmsgs_len[{:?}]", vec_logs.len(), vec_txmsgs.len());
+
+                futures::executor::block_on(async{
+                    let rlt = clkhs_insert_txmsgs(&vec_txmsgs).await;
+                    match rlt {
+                        Ok(())=> { },
+                        Err(error) => {
+                            panic!("insert_clkhs_txs_error_occurs{:?}", error);
+                        } ,
+                    };
+                });
+                println!("@@@ finish insert_txs into database!");
+                futures::executor::block_on(async{
+                    let rlt = clkhs_insert_receipts(&vec_logs).await;
+                    match rlt {
+                        Ok(())=> { },
+                        Err(error) => {
+                            panic!("insert_clkhs_logs_error_occurs{:?}", error);
+                        } ,
+                    };
+                });
+                println!("@@@ finish insert_logs into database!");
+            }
+        }
+
         OptCommand::CheckEqual { db1, db2, table } => check_table_eq(db1, db2, table)?,
         OptCommand::ReadBlock { block_number } => read_block(opt.data_dir, block_number)?,
         OptCommand::ReadAccount {

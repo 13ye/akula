@@ -1276,6 +1276,15 @@ impl Message {
         }
     }
 
+    pub const fn max_fee_per_gas2(&self) -> U256 {
+        match *self {
+            Self::Legacy { gas_price, .. } | Self::EIP2930 { gas_price, .. } => ethnum::U256::ZERO,
+            Self::EIP1559 {
+                max_fee_per_gas, ..
+            } => max_fee_per_gas,
+        }
+    }
+
     pub const fn gas_limit(&self) -> u64 {
         match *self {
             Self::Legacy { gas_limit, .. }

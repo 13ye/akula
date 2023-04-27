@@ -29,6 +29,7 @@ pub mod accessors;
 pub mod binutil;
 mod bitmapdb;
 pub mod chain;
+pub mod clkhs;
 pub mod consensus;
 pub mod crypto;
 pub mod etl;
