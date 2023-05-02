@@ -661,7 +661,7 @@ fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Op
         let receipts = processor.execute_block_no_post_validation()?;
 
         // get TxSenders in this block
-        let key_blk_number = u64::from(tx_idx).to_be_bytes();
+        let key_blk_number = u64::from(block_number).to_be_bytes();
         let tx_senders_op = txn_ro.get::<Vec<u8>>(&db_sender, &key_blk_number)?;
         let mut tx_senders:Vec<Address> = Vec::new();
         if let Some(tx_senders_op) = tx_senders_op{
@@ -746,7 +746,8 @@ fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Op
                                 tx_message_hash: row_txs.hash,
                                 address: primitive_types::U256::from_big_endian(log_obj.address.as_bytes()),
                                 data_len: data_len as u64,
-                                data_prefix: if data_len==0 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.data.slice(0..min!(32, data_len)).as_ref().try_into().unwrap())},
+                                data_prefix32: if data_len==0 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.data.slice(0..min!(32, data_len)).as_ref().try_into().unwrap())},
+                                data_prefix128: if data_len==0 {Vec::new()} else {log_obj.data.slice(0..min!(128, data_len)).to_vec()},
                                 topic_num: log_obj.topics.len() as u8,
                                 topic0: if log_obj.topics.len()<1 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[0].as_bytes())},
                                 topic1: if log_obj.topics.len()<2 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.topics[1].as_bytes())},

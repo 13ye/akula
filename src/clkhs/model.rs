@@ -33,7 +33,9 @@ pub struct TxReceiptLog {
     pub address: primitive_types::U256,
     pub data_len: u64,
     #[serde(with = "u256")]
-    pub data_prefix: primitive_types::U256,
+    pub data_prefix32: primitive_types::U256,
+    #[serde(with = "serde_bytes")]
+    pub data_prefix128: Vec<u8>,
     pub topic_num: u8,
     #[serde(with = "u256")]
     pub topic0: primitive_types::U256,
