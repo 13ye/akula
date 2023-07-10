@@ -23,7 +23,8 @@ mod u256 {
     }
 }
 
-#[derive(Debug, Row, Serialize, Deserialize)]
+// order matters
+#[derive(Debug, Row, Serialize, Deserialize, Clone)]
 pub struct TxReceiptLog {
     pub id: u64,
     pub tx_idx: u64,
@@ -47,9 +48,11 @@ pub struct TxReceiptLog {
     pub topic3: primitive_types::U256,
     #[serde(with = "u256")]
     pub topic4: primitive_types::U256,
+    pub timestamp: u64,
+    pub block_number: u64
 }
 
-#[derive(Debug, Row, Serialize, Deserialize)]
+#[derive(Debug, Row, Serialize, Deserialize, Clone)]
 pub struct TxMessage{
     pub idx: u64,
     pub block_number: u64,
@@ -77,4 +80,5 @@ pub struct TxMessage{
     pub is_create: bool,
     pub success: bool, // receipt
     pub logs_count: u64, // receipt
+    pub timestamp: u64,
 }

@@ -11,7 +11,9 @@ use akula::{
         execution::{
             clkhs_select_id,
             clkhs_insert_txmsgs,
-            clkhs_insert_receipts
+            clkhs_insert_receipts,
+            clkhs_fetch_all_logs,
+            clkhs_fetch_all_msgs
         }
     },
     binutil::AkulaDataDir,
@@ -32,7 +34,7 @@ use bytes::Bytes;
 use clap::Parser;
 use expanded_pathbuf::ExpandedPathBuf;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc, vec};
 use tokio::pin;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -580,6 +582,145 @@ fn db_receipt(data_dir: AkulaDataDir, max_height: Option<u64>) -> anyhow::Result
     Ok(())
 }
 
+fn db_logs_modify_timestamp(data_dir: AkulaDataDir, max_height_: Option<u64>, start_height: Option<u64> ) -> anyhow::Result<Vec<TxReceiptLog>> {
+    let env = open_db(data_dir.clone())?;
+    let txn = env.begin()?;
+
+    let mut block_number = BlockNumber(0);
+    if let Some(start_height) = start_height {
+        block_number = BlockNumber(start_height);
+    }
+    let chaintip = EXECUTION.get_progress(&txn)?.unwrap_or_default();
+    let mut max_height = 0;
+    if let Some(max_height_) = max_height_ {
+        max_height = max_height_;
+    }
+
+    println!("start_block:{block_number} block_sync:{chaintip}");
+    let block_stat_time = std::time::Instant::now();
+    // TxMessage: select idx(only), check blockNumber, update timestamp
+    // TxEvent: select idx as tx_idx(multiple), update timestamp
+    let mut vec_logs:Vec<TxReceiptLog> = Vec::new();
+    futures::executor::block_on(async{
+        let rlt = clkhs_fetch_all_logs(max_height*40000000,(max_height+1)*40000000).await;
+        match rlt {
+            Ok(rlt)=> {
+                vec_logs = rlt;
+            }
+            Err(error) => {
+                panic!("db_txs_logs_modify_error:{:?}", error);
+            },
+        };
+    });
+    let mut j_ = 0;
+    let id_min = vec_logs[0].tx_idx;
+    let id_max = vec_logs[vec_logs.len()-1].tx_idx;
+    println!("begining #{block_number} start{:?} max_idx:{id_max}",start_height);
+    while block_number < chaintip {
+        let start_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        block_number.0 += 1;
+        let end_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        if block_number.0 % 10_000 == 1 {
+            println!("running block #{block_number} j:{j_} min_idx:{id_min} max_idx:{id_max} start_id:{start_idx} end_id:{end_idx} time_elapsed[{:?}]", block_stat_time.elapsed());
+        }
+        if id_min > end_idx{
+            continue;
+        }
+        if id_max < start_idx{
+            break;
+        }
+        let header = chain::header::read(&txn, block_number)?.ok_or_else(|| {
+                format_err!("header not found for block #{block_number}")
+            })?;
+        for idx in start_idx..end_idx{
+            for k_ in j_..vec_logs.len(){
+                if vec_logs[k_].tx_idx==idx{
+                    println!("k_: {k_} block_number:{:?}",block_number.0);
+                    vec_logs[k_].timestamp = header.timestamp;
+                    vec_logs[k_].block_number = block_number.0;
+                    j_ = k_+1;
+                } else if vec_logs[k_].tx_idx>idx{
+                    break;
+                }
+            }
+        }
+    }
+    Ok(vec_logs)
+}
+
+fn db_msgs_modify_timestamp(data_dir: AkulaDataDir, max_height_: Option<u64>, start_height: Option<u64>) -> anyhow::Result<Vec<TxMessage>> {
+    let env = open_db(data_dir.clone())?;
+    let txn = env.begin()?;
+
+    let mut block_number = BlockNumber(0);
+    if let Some(start_height) = start_height {
+        block_number = BlockNumber(start_height);
+    }
+    let chaintip = EXECUTION.get_progress(&txn)?.unwrap_or_default();
+    let mut max_height = 0;
+    if let Some(max_height_) = max_height_ {
+        max_height = max_height_;
+    }
+
+    println!("start_block:{block_number} block_sync:{chaintip}");
+    let block_stat_time = std::time::Instant::now();
+    // TxMessage: select idx(only), check blockNumber, update timestamp
+    // TxEvent: select idx as tx_idx(multiple), update timestamp
+    let mut vec_msgs:Vec<TxMessage> = Vec::new();
+    futures::executor::block_on(async{
+        let rlt = clkhs_fetch_all_msgs(max_height*40000000,(max_height+1)*40000000).await;
+        match rlt {
+            Ok(rlt)=> {
+                vec_msgs = rlt;
+            }
+            Err(error) => {
+                panic!("db_txs_msgs_modify_error:{:?}", error);
+            },
+        };
+    });
+    let mut j_ = 0;
+    let id_min = vec_msgs[0].idx;
+    let id_max = vec_msgs[vec_msgs.len()-1].idx;
+    println!("begining #{block_number} start{:?} max_idx:{id_max}",start_height);
+    while block_number < chaintip {
+        let start_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        block_number.0 += 1;
+        let end_idx = txn.get(tables::TotalTx, block_number)?.ok_or_else(|| {
+                format_err!("totaltx not calculated for block #{block_number}")
+            })?;
+        if block_number.0 % 10_000 == 1 {
+            println!("running block #{block_number} j:{j_} min_idx:{id_min} max_idx:{id_max} start_id:{start_idx} end_id:{end_idx} time_elapsed[{:?}]", block_stat_time.elapsed());
+        }
+        if id_min > end_idx{
+            continue;
+        }
+        if id_max < start_idx{
+            break;
+        }
+        let header = chain::header::read(&txn, block_number)?.ok_or_else(|| {
+                format_err!("header not found for block #{block_number}")
+            })?;
+        for idx in start_idx..end_idx{
+            for k_ in j_..vec_msgs.len(){
+                if vec_msgs[k_].idx == idx{
+                    println!("k_: {k_} block_number:{:?}",block_number.0);
+                    vec_msgs[k_].timestamp = header.timestamp;
+                    j_ = k_+1;
+                } else if vec_msgs[k_].idx>idx{
+                    break;
+                }
+            }
+        }
+    }
+    Ok(vec_msgs)
+}
+
 fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Option<u64>, start_logs_id:u64) -> anyhow::Result<(Vec<TxReceiptLog>, Vec<TxMessage>)> {
     let env = open_db(data_dir.clone())?;
     let txn = env.begin()?;
@@ -625,6 +766,7 @@ fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Op
                 break;
             }
         }
+        println!("running block #{block_number} time_elapsed[{:?}]", block_stat_time.elapsed());
         if block_number.0 % 10_000 == 0 {
             println!("running block #{block_number} time_elapsed[{:?}]", block_stat_time.elapsed());
         }
@@ -658,7 +800,16 @@ fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Op
         );
 
         // get Receipts in this block
-        let receipts = processor.execute_block_no_post_validation()?;
+        let receipts_ = processor.execute_block_no_post_validation();
+        let mut receipts:Vec<Receipt> = vec![];
+        match receipts_{
+            Ok(rlt)=>{
+                receipts = rlt;
+            },
+            Err(err)=>{
+                panic!("{:?}",err);
+            }
+        };
 
         // get TxSenders in this block
         let key_blk_number = u64::from(block_number).to_be_bytes();
@@ -701,6 +852,7 @@ fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Op
                             idx,
                             idx_in_block: idx-start_idx,
                             block_number: block_number.0,
+                            timestamp: header.timestamp,
                             hash: primitive_types::U256::from_big_endian(message_with_signature.hash().as_bytes()),
                             chain_id: None,
                             nonce: message_with_signature.message.nonce(),
@@ -744,6 +896,8 @@ fn db_txs_logs(data_dir: AkulaDataDir, max_height: Option<u64>, start_height: Op
                                 id: logs_id,
                                 tx_idx: u64::from(tx_idx),
                                 tx_message_hash: row_txs.hash,
+                                block_number: block_number.0,
+                                timestamp: header.timestamp,
                                 address: primitive_types::U256::from_big_endian(log_obj.address.as_bytes()),
                                 data_len: data_len as u64,
                                 data_prefix32: if data_len==0 {primitive_types::U256::from(0x0)} else {primitive_types::U256::from_big_endian(log_obj.data.slice(0..min!(32, data_len)).as_ref().try_into().unwrap())},
@@ -1078,6 +1232,42 @@ async fn main() -> anyhow::Result<()> {
         }
 
         OptCommand::DbTxslog { max_height, start_height } => {
+            // 230524, temparary solution, change new id of tx_events
+            //println!("@@@ start query tx_events!");
+            //futures::executor::block_on(async{
+                //let rlt = clkhs_fetch_tx_log_test1().await;
+                //match rlt {
+                    //Ok(())=> {
+                        //panic!("insert_clkhs_logs_ok_occurs");
+                     //},
+                    //Err(error) => {
+                        //panic!("insert_clkhs_logs_error_occurs:{:?}", error);
+                    //} ,
+                //};
+            //});
+
+            //let vec_logs_ = db_msgs_modify_timestamp(opt.data_dir, max_height, start_height);
+            //match vec_logs_{
+                //Ok(vec_logs)=>{
+                   //println!("@@@ finish insert_txs into database!");
+                    //futures::executor::block_on(async{
+                        //let rlt = clkhs_insert_txmsgs(&vec_logs).await;
+                        //match rlt {
+                            //Ok(())=> { },
+                            //Err(error) => {
+                                //panic!("insert_clkhs_logs_error_occurs{:?}", error);
+                            //} ,
+                        //};
+                    //});
+                    //println!("@@@ finish insert_logs into database!");
+                //}
+                //Err(err)=>{
+                    //println!("@@@ finish insert_logs into database! {:?}", err);
+                //}
+            //}
+            //panic!("insert_clkhs_logs_error_occurs");
+            // 230526, temparary solution, add new column of timestamp for events
+
             let mut start_logs_id:u64 = 0;
             futures::executor::block_on(async{
                 let id_rlt = clkhs_select_id().await;
@@ -1087,6 +1277,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                     Err(error) => {
                         println!("clkhs_select_logs_id_error_occurs{:?}", error);
+                        panic!("clkhs_select_logs_id_error_occurs{:?}", error);
                     } ,
                 };
             });
@@ -1109,7 +1300,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(())=> { },
                         Err(error) => {
                             panic!("insert_clkhs_txs_error_occurs{:?}", error);
-                        } ,
+                        },
                     };
                 });
                 println!("@@@ finish insert_txs into database!");
